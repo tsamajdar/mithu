@@ -51,7 +51,7 @@ def load_whisper(model_size: str = "base"):
 
 
 def decode_audio_bytes_to_16k_float32(audio_bytes: bytes) -> np.ndarray:
-    """Decodes browser WebM/Ogg/WAV bytes into 16kHz mono float32 PCM via PyAV without metadata_errors."""
+    """Decodes browser WebM/Ogg/WAV bytes into 16kHz mono float32 PCM via PyAV."""
     container = av.open(io.BytesIO(audio_bytes))
     resampler = av.audio.resampler.AudioResampler(format="fltp", layout="mono", rate=16000)
     chunks = []
@@ -387,7 +387,7 @@ def run_orchestrator(
 
 
 # ---------------------------------------------------------
-# 4. Hands-Free VAD Avatar Component (AnalyserNode + MediaRecorder)
+# 4. Hands-Free VAD Avatar Component (AnalyserNode + Noise Calibration)
 # ---------------------------------------------------------
 def render_handsfree_hud_component(
     agent_name: str,
@@ -560,12 +560,11 @@ def render_handsfree_hud_component(
               if (e.data && e.data.size > 0) chunks.push(e.data);
             }};
 
-     let speechStarted = false;
+            let speechStarted = false;
             let silenceStart = null;
             let stopped = false;
             let manualForced = false;
 
-            // Auto-calibrate room background noise for the first 600ms
             let calibSamples = [];
             let noiseFloor = 8;
             let speechThreshold = 15;
@@ -625,13 +624,12 @@ def render_handsfree_hud_component(
               analyser.getByteFrequencyData(dataArray);
               let sum = 0;
               for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
-              const avgLevel = Math.round((sum / dataArray.length) / 2.55); // 0 to 100
+              const avgLevel = Math.round((sum / dataArray.length) / 2.55);
               const elapsed = Date.now() - startTime;
 
               meterFill.style.width = Math.min(100, avgLevel * 2) + "%";
               lvlTxt.innerText = "lvl: " + avgLevel + " / thr: " + speechThreshold;
 
-              // Phase 1: Measure room ambient noise for 600ms
               if (elapsed < 600) {{
                 calibSamples.push(avgLevel);
                 requestAnimationFrame(monitorVolume);
@@ -645,7 +643,6 @@ def render_handsfree_hud_component(
                 statusText.innerText = "● Listening (Speak now — auto-sends on pause)...";
               }}
 
-              // Phase 2: Detect speech above calibrated room noise & auto-stop on pause
               if (avgLevel >= speechThreshold) {{
                 if (!speechStarted) {{
                   speechStarted = true;
@@ -661,36 +658,6 @@ def render_handsfree_hud_component(
               }}
 
               if (elapsed >= MAX_RECORD_MS) {{
-                stopAndSubmit(false);
-                return;
-              }}
-              requestAnimationFrame(monitorVolume);
-            }}
-            function monitorVolume() {{
-              if (stopped) return;
-              analyser.getByteFrequencyData(dataArray);
-              let sum = 0;
-              for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
-              const avgLevel = Math.round((sum / dataArray.length) / 2.55); // 0 to 100
-
-              meterFill.style.width = Math.min(100, avgLevel * 2) + "%";
-              lvlTxt.innerText = "lvl: " + avgLevel;
-
-              if (avgLevel >= SPEECH_THRESHOLD) {{
-                if (!speechStarted) {{
-                  speechStarted = true;
-                  statusText.innerText = "● Hearing you (auto-sends when you pause)...";
-                }}
-                silenceStart = null;
-              }} else if (speechStarted) {{
-                if (!silenceStart) silenceStart = Date.now();
-                if (Date.now() - silenceStart >= SILENCE_DURATION_MS) {{
-                  stopAndSubmit(false);
-                  return;
-                }}
-              }}
-
-              if (Date.now() - startTime >= MAX_RECORD_MS) {{
                 stopAndSubmit(false);
                 return;
               }}
