@@ -2,6 +2,7 @@ streamlit
 openai
 edge-tts
 faster-whisper
+numpy
 ddgs
 requests
 beautifulsoup4

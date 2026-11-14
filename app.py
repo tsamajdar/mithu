@@ -1,6 +1,7 @@
 import os
 import io
 import json
+import wave
 import time
 import base64
 import asyncio
@@ -10,6 +11,7 @@ import threading
 import webbrowser
 from pathlib import Path
 
+import numpy as np
 import requests
 from ddgs import DDGS
 from openai import OpenAI, RateLimitError
@@ -355,7 +357,7 @@ def run_orchestrator(
 
 
 # ---------------------------------------------------------
-# 4. Hands-Free VAD Avatar Component (Auto-Stop + Auto-Loop)
+# 4. Hands-Free VAD Avatar Component (16kHz PCM WAV + Auto-Loop)
 # ---------------------------------------------------------
 def render_handsfree_hud_component(
     agent_name: str,
@@ -363,12 +365,6 @@ def render_handsfree_hud_component(
     reply_audio_b64: str,
     turn_id: int,
 ):
-    """
-    Renders the desktop-style glowing avatar card inside Streamlit.
-    - Auto-stops recording after 1.8s of silence.
-    - Plays the agent's neural voice response.
-    - Automatically re-opens the microphone when playback ends.
-    """
     html_code = f"""
     <!DOCTYPE html>
     <html>
@@ -390,23 +386,14 @@ def render_handsfree_hud_component(
         justify-content: space-between;
         box-shadow: 0 8px 24px rgba(0,0,0,0.4);
       }}
-      .left-group {{
-        display: flex;
-        align-items: center;
-        gap: 16px;
-      }}
+      .left-group {{ display: flex; align-items: center; gap: 16px; }}
       .avatar-orb {{
-        width: 68px;
-        height: 68px;
-        border-radius: 50%;
+        width: 68px; height: 68px; border-radius: 50%;
         background: radial-gradient(circle at 35% 35%, #0284c7, #0f172a);
         border: 2px solid #e2e8f0;
-        display: flex;
-        align-items: center;
-        justify-content: center;
+        display: flex; align-items: center; justify-content: center;
         box-shadow: 0 0 18px rgba(56, 189, 248, 0.6);
         transition: all 0.25s ease;
-        position: relative;
       }}
       .avatar-orb.listening {{
         background: radial-gradient(circle at 35% 35%, #16a34a, #0f172a);
@@ -423,40 +410,15 @@ def render_handsfree_hud_component(
         50% {{ transform: scale(1.06); }}
         100% {{ transform: scale(1); }}
       }}
-      .eyes {{
-        display: flex;
-        gap: 10px;
-      }}
-      .eye {{
-        width: 7px;
-        height: 7px;
-        background: #f8fafc;
-        border-radius: 50%;
-      }}
-      .title {{
-        font-size: 18px;
-        font-weight: 700;
-        margin: 0 0 4px 0;
-      }}
-      .status {{
-        font-size: 13px;
-        color: #38bdf8;
-        margin: 0;
-      }}
+      .eyes {{ display: flex; gap: 10px; }}
+      .eye {{ width: 7px; height: 7px; background: #f8fafc; border-radius: 50%; }}
+      .title {{ font-size: 18px; font-weight: 700; margin: 0 0 4px 0; }}
+      .status {{ font-size: 13px; color: #38bdf8; margin: 0; }}
       .meter-bar {{
-        width: 160px;
-        height: 5px;
-        background: #1e293b;
-        border-radius: 4px;
-        margin-top: 6px;
-        overflow: hidden;
+        width: 160px; height: 5px; background: #1e293b;
+        border-radius: 4px; margin-top: 6px; overflow: hidden;
       }}
-      .meter-fill {{
-        height: 100%;
-        width: 0%;
-        background: #4ade80;
-        transition: width 0.08s linear;
-      }}
+      .meter-fill {{ height: 100%; width: 0%; background: #4ade80; transition: width 0.08s linear; }}
     </style>
     </head>
     <body>
@@ -483,13 +445,13 @@ def render_handsfree_hud_component(
         const meterFill = document.getElementById("meterFill");
         const ttsPlayer = document.getElementById("ttsPlayer");
 
-        function sendAudioToStreamlit(base64Audio) {{
+        function sendAudioToStreamlit(base64Wav) {{
           const parentDoc = window.parent.document;
           const inputs = parentDoc.querySelectorAll('input[aria-label="vad_audio_payload"]');
           if (inputs.length > 0) {{
             const targetInput = inputs[0];
             const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-            nativeSetter.call(targetInput, turnId + "::" + base64Audio);
+            nativeSetter.call(targetInput, turnId + "::" + base64Wav);
             targetInput.dispatchEvent(new Event("input", {{ bubbles: true }}));
             targetInput.dispatchEvent(new Event("change", {{ bubbles: true }}));
             setTimeout(() => {{
@@ -500,23 +462,66 @@ def render_handsfree_hud_component(
           }}
         }}
 
+        function encodeWAV(samples, sampleRate) {{
+          const buffer = new ArrayBuffer(44 + samples.length * 2);
+          const view = new DataView(buffer);
+          const writeStr = (offset, str) => {{
+            for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+          }};
+          writeStr(0, 'RIFF');
+          view.setUint32(4, 36 + samples.length * 2, true);
+          writeStr(8, 'WAVE');
+          writeStr(12, 'fmt ');
+          view.setUint32(16, 16, true);
+          view.setUint16(20, 1, true);
+          view.setUint16(22, 1, true);
+          view.setUint32(24, sampleRate, true);
+          view.setUint32(28, sampleRate * 2, true);
+          view.setUint16(32, 2, true);
+          view.setUint16(34, 16, true);
+          writeStr(36, 'data');
+          view.setUint32(40, samples.length * 2, true);
+          let offset = 44;
+          for (let i = 0; i < samples.length; i++, offset += 2) {{
+            const s = Math.max(-1, Math.min(1, samples[i]));
+            view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+          }}
+          return new Blob([view], {{ type: 'audio/wav' }});
+        }}
+
+        function downsample(buffer, inRate, outRate) {{
+          if (outRate === inRate) return buffer;
+          const ratio = inRate / outRate;
+          const newLen = Math.round(buffer.length / ratio);
+          const result = new Float32Array(newLen);
+          let offsetResult = 0, offsetBuffer = 0;
+          while (offsetResult < result.length) {{
+            const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+            let accum = 0, count = 0;
+            for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {{
+              accum += buffer[i];
+              count++;
+            }}
+            result[offsetResult] = accum / count;
+            offsetResult++;
+            offsetBuffer = nextOffsetBuffer;
+          }}
+          return result;
+        }}
+
         async function startAutoSilenceRecording() {{
           if (!handsFree) return;
           try {{
             const stream = await navigator.mediaDevices.getUserMedia({{ audio: true }});
             const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             const source = audioCtx.createMediaStreamSource(stream);
-            const analyser = audioCtx.createAnalyser();
-            analyser.fftSize = 1024;
-            source.connect(analyser);
+            const processor = audioCtx.createScriptProcessor(4096, 1, 1);
 
-            const mediaRecorder = new MediaRecorder(stream);
-            const chunks = [];
-            mediaRecorder.ondataavailable = e => {{ if (e.data.size > 0) chunks.push(e.data); }};
-
+            const pcmChunks = [];
             let speechStarted = false;
             let silenceStart = null;
-            const SILENCE_THRESHOLD = 0.025;
+            let stopped = false;
+            const SILENCE_THRESHOLD = 0.02;
             const SILENCE_DURATION_MS = 1800;
             const MAX_RECORD_MS = 15000;
             const startTime = Date.now();
@@ -525,10 +530,16 @@ def render_handsfree_hud_component(
             statusText.style.color = "#4ade80";
             statusText.innerText = "● Listening (Speak now — auto-sends when you pause)...";
 
-            mediaRecorder.onstop = () => {{
+            function finishRecording() {{
+              if (stopped) return;
+              stopped = true;
+              processor.disconnect();
+              source.disconnect();
               stream.getTracks().forEach(t => t.stop());
+              const nativeRate = audioCtx.sampleRate;
               audioCtx.close();
               meterFill.style.width = "0%";
+
               if (!speechStarted) {{
                 if (handsFree) setTimeout(startAutoSilenceRecording, 300);
                 return;
@@ -536,27 +547,30 @@ def render_handsfree_hud_component(
               orb.className = "avatar-orb";
               statusText.style.color = "#facc15";
               statusText.innerText = "● Processing your voice...";
-              const blob = new Blob(chunks, {{ type: "audio/webm" }});
+
+              let totalLen = pcmChunks.reduce((acc, c) => acc + c.length, 0);
+              let merged = new Float32Array(totalLen);
+              let pos = 0;
+              for (let c of pcmChunks) {{ merged.set(c, pos); pos += c.length; }}
+
+              const downsampled = downsample(merged, nativeRate, 16000);
+              const wavBlob = encodeWAV(downsampled, 16000);
               const reader = new FileReader();
               reader.onloadend = () => {{
                 const b64 = reader.result.split(",")[1];
                 sendAudioToStreamlit(b64);
               }};
-              reader.readAsDataURL(blob);
-            }};
+              reader.readAsDataURL(wavBlob);
+            }}
 
-            mediaRecorder.start();
+            processor.onaudioprocess = (e) => {{
+              if (stopped) return;
+              const input = e.inputBuffer.getChannelData(0);
+              pcmChunks.push(new Float32Array(input));
 
-            const dataArray = new Uint8Array(analyser.fftSize);
-            function monitorVolume() {{
-              if (mediaRecorder.state !== "recording") return;
-              analyser.getByteTimeDomainData(dataArray);
               let sum = 0;
-              for (let i = 0; i < dataArray.length; i++) {{
-                const v = (dataArray[i] - 128) / 128;
-                sum += v * v;
-              }}
-              const rms = Math.sqrt(sum / dataArray.length);
+              for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
+              const rms = Math.sqrt(sum / input.length);
               meterFill.style.width = Math.min(100, Math.round(rms * 500)) + "%";
 
               if (rms > SILENCE_THRESHOLD) {{
@@ -565,18 +579,15 @@ def render_handsfree_hud_component(
               }} else if (speechStarted) {{
                 if (!silenceStart) silenceStart = Date.now();
                 if (Date.now() - silenceStart >= SILENCE_DURATION_MS) {{
-                  mediaRecorder.stop();
+                  finishRecording();
                   return;
                 }}
               }}
+              if (Date.now() - startTime >= MAX_RECORD_MS) finishRecording();
+            }};
 
-              if (Date.now() - startTime >= MAX_RECORD_MS) {{
-                mediaRecorder.stop();
-                return;
-              }}
-              requestAnimationFrame(monitorVolume);
-            }}
-            monitorVolume();
+            source.connect(processor);
+            processor.connect(audioCtx.destination);
           }} catch (err) {{
             statusText.style.color = "#f87171";
             statusText.innerText = "● Mic blocked: Allow microphone access in browser";
@@ -699,7 +710,7 @@ render_handsfree_hud_component(
 )
 st.session_state.reply_audio_b64 = ""
 
-# Hidden bridge input receiving base64 audio from browser VAD
+# Hidden bridge input receiving base64 16kHz PCM WAV audio from browser VAD
 vad_payload = st.text_input("vad_audio_payload", key="vad_bridge")
 
 # Display Transcript
@@ -726,19 +737,13 @@ if vad_payload and "::" in vad_payload:
         st.session_state.last_processed_turn = incoming_turn
         with st.spinner("Transcribing speech..."):
             raw_bytes = base64.b64decode(b64_audio)
-            tmp_webm = Path(tempfile.gettempdir()) / f"mithu_in_{int(time.time()*1000)}.webm"
-            try:
-                tmp_webm.write_bytes(raw_bytes)
-                whisper = load_whisper("base")
-                segments, _ = whisper.transcribe(str(tmp_webm), beam_size=1)
-                transcribed = " ".join(seg.text for seg in segments).strip()
-            finally:
-                if tmp_webm.exists():
-                    try:
-                        tmp_webm.unlink()
-                    except Exception:
-                        pass
+            with wave.open(io.BytesIO(raw_bytes), "rb") as wf:
+                pcm_int16 = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+                audio_float32 = pcm_int16.astype(np.float32) / 32768.0
 
+            whisper = load_whisper("base")
+            segments, _ = whisper.transcribe(audio_float32, beam_size=1)
+            transcribed = " ".join(seg.text for seg in segments).strip()
             if transcribed:
                 active_prompt = transcribed
             else:
