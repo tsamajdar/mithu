@@ -1,0 +1,7 @@
+streamlit
+openai
+edge-tts
+faster-whisper
+ddgs
+requests
+beautifulsoup4
