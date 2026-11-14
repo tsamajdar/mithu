@@ -18,7 +18,6 @@ from openai import OpenAI, RateLimitError
 import edge_tts
 from faster_whisper import WhisperModel
 import streamlit as st
-import streamlit.components.v1 as components
 
 # ---------------------------------------------------------
 # 1. Configuration, Secrets & Voices
@@ -51,7 +50,7 @@ def load_whisper(model_size: str = "base"):
 
 
 def decode_audio_bytes_to_16k_float32(audio_bytes: bytes) -> np.ndarray:
-    """Decodes browser WebM/Ogg/WAV bytes into 16kHz mono float32 PCM via PyAV."""
+    """Decodes audio bytes into 16kHz mono float32 PCM via PyAV."""
     container = av.open(io.BytesIO(audio_bytes))
     resampler = av.audio.resampler.AudioResampler(format="fltp", layout="mono", rate=16000)
     chunks = []
@@ -387,351 +386,21 @@ def run_orchestrator(
 
 
 # ---------------------------------------------------------
-# 4. Hands-Free VAD Avatar Component (AnalyserNode + Noise Calibration)
+# 4. Main Streamlit App UI (Native Voice HUD Theme)
 # ---------------------------------------------------------
-def render_handsfree_hud_component(
-    agent_name: str,
-    hands_free_on: bool,
-    reply_audio_b64: str,
-    open_url: str,
-    turn_id: int,
-):
-    render_nonce = int(time.time() * 1000)
-    js_agent_name = json.dumps(agent_name)
-    js_hands_free = "true" if hands_free_on else "false"
-    js_reply_b64 = json.dumps(reply_audio_b64 or "")
-    js_open_url = json.dumps(open_url or "")
-
-    html_code = f"""
-    <!DOCTYPE html>
-    <html>
-    <!-- turn:{turn_id} nonce:{render_nonce} -->
-    <head>
-    <style>
-      body {{
-        margin: 0;
-        background: transparent;
-        font-family: 'Segoe UI', sans-serif;
-        color: #f1f5f9;
-      }}
-      .hud-card {{
-        background: rgba(15, 23, 42, 0.96);
-        border: 1px solid rgba(56, 189, 248, 0.55);
-        border-radius: 18px;
-        padding: 14px 18px;
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        box-shadow: 0 8px 24px rgba(0,0,0,0.4);
-      }}
-      .left-group {{ display: flex; align-items: center; gap: 16px; }}
-      .avatar-orb {{
-        width: 68px; height: 68px; border-radius: 50%;
-        background: radial-gradient(circle at 35% 35%, #0284c7, #0f172a);
-        border: 2px solid #e2e8f0;
-        display: flex; align-items: center; justify-content: center;
-        box-shadow: 0 0 18px rgba(56, 189, 248, 0.6);
-        transition: all 0.25s ease;
-        cursor: pointer;
-      }}
-      .avatar-orb.listening {{
-        background: radial-gradient(circle at 35% 35%, #16a34a, #0f172a);
-        box-shadow: 0 0 24px rgba(74, 222, 128, 0.85);
-        animation: pulse 1.2s infinite;
-      }}
-      .avatar-orb.speaking {{
-        background: radial-gradient(circle at 35% 35%, #7e22ce, #0f172a);
-        box-shadow: 0 0 24px rgba(192, 132, 252, 0.85);
-        animation: pulse 0.7s infinite;
-      }}
-      @keyframes pulse {{
-        0% {{ transform: scale(1); }}
-        50% {{ transform: scale(1.06); }}
-        100% {{ transform: scale(1); }}
-      }}
-      .eyes {{ display: flex; gap: 10px; }}
-      .eye {{ width: 7px; height: 7px; background: #f8fafc; border-radius: 50%; }}
-      .title {{ font-size: 18px; font-weight: 700; margin: 0 0 4px 0; }}
-      .status {{ font-size: 13px; color: #38bdf8; margin: 0; }}
-      .meter-row {{ display: flex; align-items: center; gap: 8px; margin-top: 6px; }}
-      .meter-bar {{
-        width: 160px; height: 6px; background: #1e293b;
-        border-radius: 4px; overflow: hidden;
-      }}
-      .meter-fill {{ height: 100%; width: 0%; background: #4ade80; transition: width 0.06s linear; }}
-      .lvl-txt {{ font-size: 11px; color: #94a3b8; font-family: monospace; }}
-      .send-btn {{
-        background: #0284c7; color: #fff; border: none; border-radius: 10px;
-        padding: 8px 12px; font-size: 12px; font-weight: 600; cursor: pointer;
-      }}
-      .send-btn:hover {{ background: #0369a1; }}
-    </style>
-    </head>
-    <body>
-      <div class="hud-card">
-        <div class="left-group">
-          <div id="orb" class="avatar-orb" title="Click orb to send immediately">
-            <div class="eyes"><div class="eye"></div><div class="eye"></div></div>
-          </div>
-          <div>
-            <div class="title" id="titleBox"></div>
-            <div id="statusText" class="status">● Initializing...</div>
-            <div class="meter-row">
-              <div class="meter-bar"><div id="meterFill" class="meter-fill"></div></div>
-              <span id="lvlTxt" class="lvl-txt">lvl: 0</span>
-            </div>
-          </div>
-        </div>
-        <button id="sendNowBtn" class="send-btn" style="display:none;">Send Now ↵</button>
-        <audio id="ttsPlayer"></audio>
-      </div>
-
-      <script>
-        const agentName = {js_agent_name};
-        const handsFree = {js_hands_free};
-        const replyB64 = {js_reply_b64};
-        const pendingUrl = {js_open_url};
-        const turnId = {turn_id};
-
-        const orb = document.getElementById("orb");
-        const titleBox = document.getElementById("titleBox");
-        const statusText = document.getElementById("statusText");
-        const meterFill = document.getElementById("meterFill");
-        const lvlTxt = document.getElementById("lvlTxt");
-        const sendNowBtn = document.getElementById("sendNowBtn");
-        const ttsPlayer = document.getElementById("ttsPlayer");
-
-        let recordingActive = false;
-        let forceStopFn = null;
-
-        titleBox.innerHTML = agentName + ' <span style="font-size:11px;color:#94a3b8;">(v3 • Turn ' + (turnId + 1) + ')</span>';
-
-        if (pendingUrl && pendingUrl.startsWith("http")) {{
-          try {{
-            window.top.open(pendingUrl, "_blank", "noopener,noreferrer");
-          }} catch (e) {{
-            window.open(pendingUrl, "_blank", "noopener,noreferrer");
-          }}
-        }}
-
-        function sendAudioToStreamlit(base64Audio) {{
-          const parentDoc = window.parent.document;
-          const inputs = parentDoc.querySelectorAll('input[aria-label="vad_audio_payload"]');
-          if (inputs.length > 0) {{
-            const targetInput = inputs[0];
-            const lastValue = targetInput.value;
-            const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-            nativeSetter.call(targetInput, turnId + "::" + base64Audio);
-
-            const tracker = targetInput._valueTracker;
-            if (tracker) tracker.setValue(lastValue);
-
-            targetInput.dispatchEvent(new Event("input", {{ bubbles: true }}));
-            targetInput.dispatchEvent(new Event("change", {{ bubbles: true }}));
-            setTimeout(() => {{
-              targetInput.dispatchEvent(new KeyboardEvent("keydown", {{
-                key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true
-              }}));
-            }}, 100);
-          }} else {{
-            statusText.style.color = "#f87171";
-            statusText.innerText = "● Bridge input not found";
-          }}
-        }}
-
-        async function startAutoSilenceRecording() {{
-          if (!handsFree || recordingActive) return;
-          recordingActive = true;
-          try {{
-            statusText.style.color = "#facc15";
-            statusText.innerText = "● Opening microphone...";
-            const stream = await navigator.mediaDevices.getUserMedia({{ audio: true }});
-            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-            if (audioCtx.state === "suspended") await audioCtx.resume();
-
-            const source = audioCtx.createMediaStreamSource(stream);
-            const analyser = audioCtx.createAnalyser();
-            analyser.fftSize = 1024;
-            source.connect(analyser);
-
-            const mediaRecorder = new MediaRecorder(stream);
-            const chunks = [];
-            mediaRecorder.ondataavailable = (e) => {{
-              if (e.data && e.data.size > 0) chunks.push(e.data);
-            }};
-
-            let speechStarted = false;
-            let silenceStart = null;
-            let stopped = false;
-            let manualForced = false;
-
-            let calibSamples = [];
-            let noiseFloor = 8;
-            let speechThreshold = 15;
-            const SILENCE_DURATION_MS = 1400;
-            const MAX_RECORD_MS = 15000;
-            const startTime = Date.now();
-
-            orb.className = "avatar-orb listening";
-            statusText.style.color = "#facc15";
-            statusText.innerText = "● Calibrating room noise (0.6s)...";
-            sendNowBtn.style.display = "inline-block";
-
-            function stopAndSubmit(isManual) {{
-              if (stopped) return;
-              stopped = true;
-              manualForced = isManual;
-              sendNowBtn.style.display = "none";
-              if (mediaRecorder.state !== "inactive") {{
-                mediaRecorder.stop();
-              }}
-            }}
-
-            forceStopFn = () => stopAndSubmit(true);
-            sendNowBtn.onclick = () => stopAndSubmit(true);
-
-            mediaRecorder.onstop = () => {{
-              recordingActive = false;
-              forceStopFn = null;
-              stream.getTracks().forEach(t => t.stop());
-              audioCtx.close();
-              meterFill.style.width = "0%";
-              lvlTxt.innerText = "lvl: 0";
-
-              if (!speechStarted && !manualForced) {{
-                if (handsFree) setTimeout(startAutoSilenceRecording, 250);
-                return;
-              }}
-
-              orb.className = "avatar-orb";
-              statusText.style.color = "#facc15";
-              statusText.innerText = "● Transcribing your voice...";
-
-              const blob = new Blob(chunks, {{ type: mediaRecorder.mimeType || "audio/webm" }});
-              const reader = new FileReader();
-              reader.onloadend = () => {{
-                const b64 = reader.result.split(",")[1];
-                sendAudioToStreamlit(b64);
-              }};
-              reader.readAsDataURL(blob);
-            }};
-
-            mediaRecorder.start(250);
-
-            const dataArray = new Uint8Array(analyser.frequencyBinCount);
-            function monitorVolume() {{
-              if (stopped) return;
-              analyser.getByteFrequencyData(dataArray);
-              let sum = 0;
-              for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
-              const avgLevel = Math.round((sum / dataArray.length) / 2.55);
-              const elapsed = Date.now() - startTime;
-
-              meterFill.style.width = Math.min(100, avgLevel * 2) + "%";
-              lvlTxt.innerText = "lvl: " + avgLevel + " / thr: " + speechThreshold;
-
-              if (elapsed < 600) {{
-                calibSamples.push(avgLevel);
-                requestAnimationFrame(monitorVolume);
-                return;
-              }} else if (calibSamples.length > 0) {{
-                const avgNoise = calibSamples.reduce((a, b) => a + b, 0) / calibSamples.length;
-                noiseFloor = Math.round(avgNoise);
-                speechThreshold = Math.min(45, Math.max(noiseFloor + 6, 12));
-                calibSamples = [];
-                statusText.style.color = "#4ade80";
-                statusText.innerText = "● Listening (Speak now — auto-sends on pause)...";
-              }}
-
-              if (avgLevel >= speechThreshold) {{
-                if (!speechStarted) {{
-                  speechStarted = true;
-                  statusText.innerText = "● Hearing you (auto-sends when you pause)...";
-                }}
-                silenceStart = null;
-              }} else if (speechStarted) {{
-                if (!silenceStart) silenceStart = Date.now();
-                if (Date.now() - silenceStart >= SILENCE_DURATION_MS) {{
-                  stopAndSubmit(false);
-                  return;
-                }}
-              }}
-
-              if (elapsed >= MAX_RECORD_MS) {{
-                stopAndSubmit(false);
-                return;
-              }}
-              requestAnimationFrame(monitorVolume);
-            }}
-            monitorVolume();
-          }} catch (err) {{
-            recordingActive = false;
-            sendNowBtn.style.display = "none";
-            statusText.style.color = "#f87171";
-            statusText.innerText = "● Mic notice: " + (err.message || err);
-          }}
-        }}
-
-        orb.addEventListener("click", () => {{
-          if (recordingActive && forceStopFn) {{
-            forceStopFn();
-          }} else if (handsFree && !recordingActive) {{
-            startAutoSilenceRecording();
-          }}
-        }});
-
-        function resumeAfterSpeech() {{
-          orb.className = "avatar-orb";
-          statusText.style.color = "#38bdf8";
-          statusText.innerText = "● Standby";
-          if (handsFree) setTimeout(startAutoSilenceRecording, 350);
-        }}
-
-        if (!handsFree) {{
-          orb.className = "avatar-orb";
-          statusText.style.color = "#38bdf8";
-          statusText.innerText = "● Standby — Click Start Live to speak";
-        }} else if (replyB64 && replyB64.length > 10) {{
-          orb.className = "avatar-orb speaking";
-          statusText.style.color = "#c084fc";
-          statusText.innerText = "● Speaking...";
-          ttsPlayer.src = "data:audio/mp3;base64," + replyB64;
-
-          let resumed = false;
-          const safeResume = () => {{
-            if (resumed) return;
-            resumed = true;
-            resumeAfterSpeech();
-          }};
-
-          ttsPlayer.onended = safeResume;
-          ttsPlayer.onerror = safeResume;
-          ttsPlayer.play().catch(safeResume);
-
-          setTimeout(() => {{
-            if (ttsPlayer.paused && !resumed) safeResume();
-          }}, 12000);
-        }} else {{
-          startAutoSilenceRecording();
-        }}
-      </script>
-    </body>
-    </html>
-    """
-    components.html(html_code, height=116)
-
-
-# ---------------------------------------------------------
-# 5. Main Streamlit App UI (Desktop HUD Theme)
-# ---------------------------------------------------------
-st.set_page_config(page_title="M.I.T.H.U. Hands-Free Voice Agent", page_icon="🎙️", layout="centered")
+st.set_page_config(page_title="M.I.T.H.U. Voice Agent", page_icon="🎙️", layout="centered")
 
 st.markdown(
     """
     <style>
       .stApp { background-color: #0b1120; color: #f1f5f9; }
-      div[data-testid="stTextInput"]:has(input[aria-label="vad_audio_payload"]) {
-        position: fixed; left: -9999px; opacity: 0; height: 0; overflow: hidden;
+      .hud-card {
+        background: rgba(15, 23, 42, 0.96);
+        border: 1px solid rgba(56, 189, 248, 0.55);
+        border-radius: 18px;
+        padding: 16px 20px;
+        margin-bottom: 20px;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.4);
       }
     </style>
     """,
@@ -799,44 +468,32 @@ with st.sidebar:
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
-if "hands_free_on" not in st.session_state:
-    st.session_state.hands_free_on = False
 if "reply_audio_b64" not in st.session_state:
     st.session_state.reply_audio_b64 = ""
-if "pending_open_url" not in st.session_state:
-    st.session_state.pending_open_url = ""
-if "turn_id" not in st.session_state:
-    st.session_state.turn_id = 0
-if "last_processed_turn" not in st.session_state:
-    st.session_state.last_processed_turn = -1
 
-# Top Control Bar
-c1, c2 = st.columns([3, 1])
-with c1:
-    st.caption("🔍 Research • ✍️ Content • 📣 Ads • 💻 Dev (Background) • 🎧 Support • ⚙️ Ops")
-with c2:
-    btn_label = "🔴 Stop Live" if st.session_state.hands_free_on else "🎤 Start Live"
-    if st.button(btn_label, use_container_width=True, type="primary"):
-        st.session_state.hands_free_on = not st.session_state.hands_free_on
-        st.session_state.reply_audio_b64 = ""
-        st.session_state.pending_open_url = ""
-        st.rerun()
+st.caption("🔍 Research • ✍️ Content • 📣 Ads • 💻 Dev (Background) • 🎧 Support • ⚙️ Ops")
 
-# Render Glowing HUD + Hands-Free Auto-Stop Voice Loop + Client Tab Opener
-render_handsfree_hud_component(
-    agent_name=agent_name,
-    hands_free_on=st.session_state.hands_free_on,
-    reply_audio_b64=st.session_state.reply_audio_b64,
-    open_url=st.session_state.pending_open_url,
-    turn_id=st.session_state.turn_id,
+# Gorgeous Native HUD Card with Voice Recorder
+st.markdown(
+    f"""
+    <div class="hud-card">
+      <div style="font-size: 20px; font-weight: 700; color: #f8fafc; margin-bottom: 4px;">🎙️ {agent_name} Voice Companion</div>
+      <div style="font-size: 13px; color: #38bdf8;">Click the microphone below to speak. Transcription and voice replies happen instantly.</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
-st.session_state.reply_audio_b64 = ""
-st.session_state.pending_open_url = ""
 
-# Hidden bridge input receiving base64 browser audio from VAD
-vad_payload = st.text_input("vad_audio_payload", key="vad_bridge")
+# Play Audio Reply if available
+if st.session_state.reply_audio_b64:
+    audio_bytes = base64.b64decode(st.session_state.reply_audio_b64)
+    st.audio(audio_bytes, format="audio/mp3", autoplay=True)
+    st.session_state.reply_audio_b64 = ""
 
-# Display Transcript
+# Native Streamlit Audio Input (Bypasses iframe sandbox microphone blocks completely)
+audio_val = st.audio_input("Speak to M.I.T.H.U.")
+
+# Display Transcript History
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
@@ -849,30 +506,16 @@ for m in st.session_state.messages:
 typed_prompt = st.chat_input(f"Or type a command for {agent_name}...")
 active_prompt = None
 
-if vad_payload and "::" in vad_payload:
-    turn_str, b64_audio = vad_payload.split("::", 1)
-    try:
-        incoming_turn = int(turn_str)
-    except ValueError:
-        incoming_turn = -1
-
-    if incoming_turn == st.session_state.turn_id and incoming_turn != st.session_state.last_processed_turn:
-        st.session_state.last_processed_turn = incoming_turn
-        with st.spinner("Transcribing speech..."):
-            raw_bytes = base64.b64decode(b64_audio)
-            audio_float32 = decode_audio_bytes_to_16k_float32(raw_bytes)
-            if audio_float32.size > 0:
-                whisper = load_whisper("base")
-                segments, _ = whisper.transcribe(audio_float32, beam_size=1)
-                transcribed = " ".join(seg.text for seg in segments).strip()
-            else:
-                transcribed = ""
-
+if audio_val is not None:
+    with st.spinner("Transcribing your voice..."):
+        raw_bytes = audio_val.read()
+        audio_float32 = decode_audio_bytes_to_16k_float32(raw_bytes)
+        if audio_float32.size > 0:
+            whisper = load_whisper("base")
+            segments, _ = whisper.transcribe(audio_float32, beam_size=1)
+            transcribed = " ".join(seg.text for seg in segments).strip()
             if transcribed:
                 active_prompt = transcribed
-            else:
-                st.session_state.turn_id += 1
-                st.rerun()
 
 if typed_prompt:
     active_prompt = typed_prompt
@@ -896,13 +539,10 @@ if active_prompt:
         language_pref=language_pref,
         n8n_url=n8n_url,
         conversation=clean_history,
-    )
+    ]
 
     if voice_enabled:
         st.session_state.reply_audio_b64 = synthesize_speech_b64(reply, selected_voice)
-    if url_to_open:
-        st.session_state.pending_open_url = url_to_open
 
     st.session_state.messages.append({"role": "assistant", "content": reply, "logs": logs})
-    st.session_state.turn_id += 1
     st.rerun()
