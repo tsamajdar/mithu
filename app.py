@@ -560,18 +560,22 @@ def render_handsfree_hud_component(
               if (e.data && e.data.size > 0) chunks.push(e.data);
             }};
 
-            let speechStarted = false;
+     let speechStarted = false;
             let silenceStart = null;
             let stopped = false;
             let manualForced = false;
-            const SPEECH_THRESHOLD = 3; // 0-100 scale (very sensitive for laptop mics)
-            const SILENCE_DURATION_MS = 1600;
+
+            // Auto-calibrate room background noise for the first 600ms
+            let calibSamples = [];
+            let noiseFloor = 8;
+            let speechThreshold = 15;
+            const SILENCE_DURATION_MS = 1400;
             const MAX_RECORD_MS = 15000;
             const startTime = Date.now();
 
             orb.className = "avatar-orb listening";
-            statusText.style.color = "#4ade80";
-            statusText.innerText = "● Listening (Speak now — auto-sends on pause)...";
+            statusText.style.color = "#facc15";
+            statusText.innerText = "● Calibrating room noise (0.6s)...";
             sendNowBtn.style.display = "inline-block";
 
             function stopAndSubmit(isManual) {{
@@ -616,6 +620,52 @@ def render_handsfree_hud_component(
             mediaRecorder.start(250);
 
             const dataArray = new Uint8Array(analyser.frequencyBinCount);
+            function monitorVolume() {{
+              if (stopped) return;
+              analyser.getByteFrequencyData(dataArray);
+              let sum = 0;
+              for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+              const avgLevel = Math.round((sum / dataArray.length) / 2.55); // 0 to 100
+              const elapsed = Date.now() - startTime;
+
+              meterFill.style.width = Math.min(100, avgLevel * 2) + "%";
+              lvlTxt.innerText = "lvl: " + avgLevel + " / thr: " + speechThreshold;
+
+              // Phase 1: Measure room ambient noise for 600ms
+              if (elapsed < 600) {{
+                calibSamples.push(avgLevel);
+                requestAnimationFrame(monitorVolume);
+                return;
+              }} else if (calibSamples.length > 0) {{
+                const avgNoise = calibSamples.reduce((a, b) => a + b, 0) / calibSamples.length;
+                noiseFloor = Math.round(avgNoise);
+                speechThreshold = Math.min(45, Math.max(noiseFloor + 6, 12));
+                calibSamples = [];
+                statusText.style.color = "#4ade80";
+                statusText.innerText = "● Listening (Speak now — auto-sends on pause)...";
+              }}
+
+              // Phase 2: Detect speech above calibrated room noise & auto-stop on pause
+              if (avgLevel >= speechThreshold) {{
+                if (!speechStarted) {{
+                  speechStarted = true;
+                  statusText.innerText = "● Hearing you (auto-sends when you pause)...";
+                }}
+                silenceStart = null;
+              }} else if (speechStarted) {{
+                if (!silenceStart) silenceStart = Date.now();
+                if (Date.now() - silenceStart >= SILENCE_DURATION_MS) {{
+                  stopAndSubmit(false);
+                  return;
+                }}
+              }}
+
+              if (elapsed >= MAX_RECORD_MS) {{
+                stopAndSubmit(false);
+                return;
+              }}
+              requestAnimationFrame(monitorVolume);
+            }}
             function monitorVolume() {{
               if (stopped) return;
               analyser.getByteFrequencyData(dataArray);
