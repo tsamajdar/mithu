@@ -440,7 +440,7 @@ def render_handsfree_hud_component(
       .title {{ font-size: 18px; font-weight: 700; margin: 0 0 4px 0; }}
       .status {{ font-size: 13px; color: #38bdf8; margin: 0; }}
       .meter-bar {{
-        width: 160px; height: 5px; background: #1e293b;
+        width: 180px; height: 6px; background: #1e293b;
         border-radius: 4px; margin-top: 6px; overflow: hidden;
       }}
       .meter-fill {{ height: 100%; width: 0%; background: #4ade80; transition: width 0.08s linear; }}
@@ -449,7 +449,7 @@ def render_handsfree_hud_component(
     <body>
       <div class="hud-card">
         <div class="left-group">
-          <div id="orb" class="avatar-orb" title="Click orb to force listen">
+          <div id="orb" class="avatar-orb" title="Click orb to send immediately">
             <div class="eyes"><div class="eye"></div><div class="eye"></div></div>
           </div>
           <div>
@@ -474,6 +474,7 @@ def render_handsfree_hud_component(
         const meterFill = document.getElementById("meterFill");
         const ttsPlayer = document.getElementById("ttsPlayer");
         let recordingActive = false;
+        let forceStopFn = null;
 
         titleBox.innerHTML = agentName + ' <span style="font-size:11px;color:#94a3b8;">(Turn ' + (turnId + 1) + ')</span>';
 
@@ -563,7 +564,9 @@ def render_handsfree_hud_component(
           try {{
             statusText.style.color = "#facc15";
             statusText.innerText = "● Opening microphone...";
-            const stream = await navigator.mediaDevices.getUserMedia({{ audio: true }});
+            const stream = await navigator.mediaDevices.getUserMedia({{
+              audio: {{ echoCancellation: true, noiseSuppression: true, autoGainControl: true }}
+            }});
             const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             if (audioCtx.state === "suspended") await audioCtx.resume();
 
@@ -574,19 +577,20 @@ def render_handsfree_hud_component(
             let speechStarted = false;
             let silenceStart = null;
             let stopped = false;
-            const SILENCE_THRESHOLD = 0.015;
-            const SILENCE_DURATION_MS = 1600;
+            const SPEECH_THRESHOLD = 0.004;
+            const SILENCE_DURATION_MS = 1500;
             const MAX_RECORD_MS = 15000;
             const startTime = Date.now();
 
             orb.className = "avatar-orb listening";
             statusText.style.color = "#4ade80";
-            statusText.innerText = "● Listening (Speak now — auto-sends when you pause)...";
+            statusText.innerText = "● Listening (Speak now — auto-sends on pause)...";
 
-            function finishRecording() {{
+            function finishRecording(manualForce = false) {{
               if (stopped) return;
               stopped = true;
               recordingActive = false;
+              forceStopFn = null;
               processor.disconnect();
               source.disconnect();
               stream.getTracks().forEach(t => t.stop());
@@ -594,13 +598,13 @@ def render_handsfree_hud_component(
               audioCtx.close();
               meterFill.style.width = "0%";
 
-              if (!speechStarted) {{
-                if (handsFree) setTimeout(startAutoSilenceRecording, 250);
+              if (!speechStarted && !manualForce) {{
+                if (handsFree) setTimeout(startAutoSilenceRecording, 200);
                 return;
               }}
               orb.className = "avatar-orb";
               statusText.style.color = "#facc15";
-              statusText.innerText = "● Processing your voice...";
+              statusText.innerText = "● Transcribing your voice...";
 
               let totalLen = pcmChunks.reduce((acc, c) => acc + c.length, 0);
               let merged = new Float32Array(totalLen);
@@ -617,6 +621,8 @@ def render_handsfree_hud_component(
               reader.readAsDataURL(wavBlob);
             }}
 
+            forceStopFn = () => finishRecording(true);
+
             processor.onaudioprocess = (e) => {{
               if (stopped) return;
               const input = e.inputBuffer.getChannelData(0);
@@ -625,19 +631,22 @@ def render_handsfree_hud_component(
               let sum = 0;
               for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
               const rms = Math.sqrt(sum / input.length);
-              meterFill.style.width = Math.min(100, Math.round(rms * 500)) + "%";
+              meterFill.style.width = Math.min(100, Math.round(rms * 1500)) + "%";
 
-              if (rms > SILENCE_THRESHOLD) {{
-                speechStarted = true;
+              if (rms > SPEECH_THRESHOLD) {{
+                if (!speechStarted) {{
+                  speechStarted = true;
+                  statusText.innerText = "● Hearing you (will send when you pause)...";
+                }}
                 silenceStart = null;
               }} else if (speechStarted) {{
                 if (!silenceStart) silenceStart = Date.now();
                 if (Date.now() - silenceStart >= SILENCE_DURATION_MS) {{
-                  finishRecording();
+                  finishRecording(false);
                   return;
                 }}
               }}
-              if (Date.now() - startTime >= MAX_RECORD_MS) finishRecording();
+              if (Date.now() - startTime >= MAX_RECORD_MS) finishRecording(false);
             }};
 
             source.connect(processor);
@@ -650,7 +659,11 @@ def render_handsfree_hud_component(
         }}
 
         orb.addEventListener("click", () => {{
-          if (handsFree && !recordingActive) startAutoSilenceRecording();
+          if (recordingActive && forceStopFn) {{
+            forceStopFn();
+          }} else if (handsFree && !recordingActive) {{
+            startAutoSilenceRecording();
+          }}
         }});
 
         function resumeAfterSpeech() {{
