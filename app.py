@@ -726,9 +726,19 @@ if vad_payload and "::" in vad_payload:
         st.session_state.last_processed_turn = incoming_turn
         with st.spinner("Transcribing speech..."):
             raw_bytes = base64.b64decode(b64_audio)
-            whisper = load_whisper("base")
-            segments, _ = whisper.transcribe(io.BytesIO(raw_bytes), beam_size=1)
-            transcribed = " ".join(seg.text for seg in segments).strip()
+            tmp_webm = Path(tempfile.gettempdir()) / f"mithu_in_{int(time.time()*1000)}.webm"
+            try:
+                tmp_webm.write_bytes(raw_bytes)
+                whisper = load_whisper("base")
+                segments, _ = whisper.transcribe(str(tmp_webm), beam_size=1)
+                transcribed = " ".join(seg.text for seg in segments).strip()
+            finally:
+                if tmp_webm.exists():
+                    try:
+                        tmp_webm.unlink()
+                    except Exception:
+                        pass
+
             if transcribed:
                 active_prompt = transcribed
             else:
