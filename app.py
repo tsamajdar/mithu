@@ -190,7 +190,7 @@ def spawn_background_website_builder(
 
     threading.Thread(target=_build_worker, daemon=True).start()
     return (
-        f"Dev Team started building '{project_title}' in the background. It will appear in the Generated Websites panel once ready.",
+        f"Dev Team started building '{project_title}' in the background. It will appear in the sidebar once ready.",
         out_file,
     )
 
@@ -373,7 +373,7 @@ def run_orchestrator(
 
 
 # ---------------------------------------------------------
-# 4. Hands-Free VAD Avatar Component (Client-Side Tab Open + Auto-Loop)
+# 4. Hands-Free VAD Avatar Component (JSON-Safe + Click-to-Wake)
 # ---------------------------------------------------------
 def render_handsfree_hud_component(
     agent_name: str,
@@ -383,6 +383,11 @@ def render_handsfree_hud_component(
     turn_id: int,
 ):
     render_nonce = int(time.time() * 1000)
+    js_agent_name = json.dumps(agent_name)
+    js_hands_free = "true" if hands_free_on else "false"
+    js_reply_b64 = json.dumps(reply_audio_b64 or "")
+    js_open_url = json.dumps(open_url or "")
+
     html_code = f"""
     <!DOCTYPE html>
     <html>
@@ -413,6 +418,7 @@ def render_handsfree_hud_component(
         display: flex; align-items: center; justify-content: center;
         box-shadow: 0 0 18px rgba(56, 189, 248, 0.6);
         transition: all 0.25s ease;
+        cursor: pointer;
       }}
       .avatar-orb.listening {{
         background: radial-gradient(circle at 35% 35%, #16a34a, #0f172a);
@@ -443,12 +449,12 @@ def render_handsfree_hud_component(
     <body>
       <div class="hud-card">
         <div class="left-group">
-          <div id="orb" class="avatar-orb">
+          <div id="orb" class="avatar-orb" title="Click orb to force listen">
             <div class="eyes"><div class="eye"></div><div class="eye"></div></div>
           </div>
           <div>
-            <div class="title">{agent_name} <span style="font-size:11px;color:#94a3b8;">(Turn {turn_id + 1})</span></div>
-            <div id="statusText" class="status">● Standby — Click Start Live to speak</div>
+            <div class="title" id="titleBox"></div>
+            <div id="statusText" class="status">● Initializing...</div>
             <div class="meter-bar"><div id="meterFill" class="meter-fill"></div></div>
           </div>
         </div>
@@ -456,15 +462,20 @@ def render_handsfree_hud_component(
       </div>
 
       <script>
-        const handsFree = {str(hands_free_on).lower()};
-        const replyB64 = "{reply_audio_b64}";
-        const pendingUrl = "{open_url}";
+        const agentName = {js_agent_name};
+        const handsFree = {js_hands_free};
+        const replyB64 = {js_reply_b64};
+        const pendingUrl = {js_open_url};
         const turnId = {turn_id};
+
         const orb = document.getElementById("orb");
+        const titleBox = document.getElementById("titleBox");
         const statusText = document.getElementById("statusText");
         const meterFill = document.getElementById("meterFill");
         const ttsPlayer = document.getElementById("ttsPlayer");
         let recordingActive = false;
+
+        titleBox.innerHTML = agentName + ' <span style="font-size:11px;color:#94a3b8;">(Turn ' + (turnId + 1) + ')</span>';
 
         if (pendingUrl && pendingUrl.startsWith("http")) {{
           try {{
@@ -483,11 +494,9 @@ def render_handsfree_hud_component(
             const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
             nativeSetter.call(targetInput, turnId + "::" + base64Wav);
 
-            // Reset React's internal value tracker so Streamlit registers every subsequent turn
             const tracker = targetInput._valueTracker;
-            if (tracker) {{
-              tracker.setValue(lastValue);
-            }}
+            if (tracker) tracker.setValue(lastValue);
+
             targetInput.dispatchEvent(new Event("input", {{ bubbles: true }}));
             targetInput.dispatchEvent(new Event("change", {{ bubbles: true }}));
             setTimeout(() => {{
@@ -495,6 +504,9 @@ def render_handsfree_hud_component(
                 key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true
               }}));
             }}, 100);
+          }} else {{
+            statusText.style.color = "#f87171";
+            statusText.innerText = "● Bridge input not found";
           }}
         }}
 
@@ -549,8 +561,12 @@ def render_handsfree_hud_component(
           if (!handsFree || recordingActive) return;
           recordingActive = true;
           try {{
+            statusText.style.color = "#facc15";
+            statusText.innerText = "● Opening microphone...";
             const stream = await navigator.mediaDevices.getUserMedia({{ audio: true }});
             const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            if (audioCtx.state === "suspended") await audioCtx.resume();
+
             const source = audioCtx.createMediaStreamSource(stream);
             const processor = audioCtx.createScriptProcessor(4096, 1, 1);
 
@@ -558,7 +574,7 @@ def render_handsfree_hud_component(
             let speechStarted = false;
             let silenceStart = null;
             let stopped = false;
-            const SILENCE_THRESHOLD = 0.018;
+            const SILENCE_THRESHOLD = 0.015;
             const SILENCE_DURATION_MS = 1600;
             const MAX_RECORD_MS = 15000;
             const startTime = Date.now();
@@ -629,9 +645,13 @@ def render_handsfree_hud_component(
           }} catch (err) {{
             recordingActive = false;
             statusText.style.color = "#f87171";
-            statusText.innerText = "● Mic blocked: Allow microphone access in browser";
+            statusText.innerText = "● Mic notice: " + (err.message || err);
           }}
         }}
+
+        orb.addEventListener("click", () => {{
+          if (handsFree && !recordingActive) startAutoSilenceRecording();
+        }});
 
         function resumeAfterSpeech() {{
           orb.className = "avatar-orb";
@@ -640,7 +660,11 @@ def render_handsfree_hud_component(
           if (handsFree) setTimeout(startAutoSilenceRecording, 350);
         }}
 
-        if (replyB64 && replyB64.length > 10) {{
+        if (!handsFree) {{
+          orb.className = "avatar-orb";
+          statusText.style.color = "#38bdf8";
+          statusText.innerText = "● Standby — Click Start Live to speak";
+        }} else if (replyB64 && replyB64.length > 10) {{
           orb.className = "avatar-orb speaking";
           statusText.style.color = "#c084fc";
           statusText.innerText = "● Speaking...";
@@ -657,11 +681,10 @@ def render_handsfree_hud_component(
           ttsPlayer.onerror = safeResume;
           ttsPlayer.play().catch(safeResume);
 
-          // Watchdog fallback in case browser suspends audio tab playback
           setTimeout(() => {{
             if (ttsPlayer.paused && !resumed) safeResume();
           }}, 12000);
-        }} else if (handsFree) {{
+        }} else {{
           startAutoSilenceRecording();
         }}
       </script>
@@ -727,7 +750,6 @@ with st.sidebar:
     )
     n8n_url = st.text_input("n8n Webhook URL", value="http://localhost:5678/webhook/agent-ops")
 
-    # Show any websites generated in the background by the Dev Team
     generated_files = sorted(WORKSPACE_DIR.glob("*.html"), key=lambda p: p.stat().st_mtime, reverse=True)
     if generated_files:
         st.divider()
