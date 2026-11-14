@@ -382,9 +382,11 @@ def render_handsfree_hud_component(
     open_url: str,
     turn_id: int,
 ):
+    render_nonce = int(time.time() * 1000)
     html_code = f"""
     <!DOCTYPE html>
     <html>
+    <!-- turn:{turn_id} nonce:{render_nonce} -->
     <head>
     <style>
       body {{
@@ -445,7 +447,7 @@ def render_handsfree_hud_component(
             <div class="eyes"><div class="eye"></div><div class="eye"></div></div>
           </div>
           <div>
-            <div class="title">{agent_name}</div>
+            <div class="title">{agent_name} <span style="font-size:11px;color:#94a3b8;">(Turn {turn_id + 1})</span></div>
             <div id="statusText" class="status">● Standby — Click Start Live to speak</div>
             <div class="meter-bar"><div id="meterFill" class="meter-fill"></div></div>
           </div>
@@ -462,8 +464,8 @@ def render_handsfree_hud_component(
         const statusText = document.getElementById("statusText");
         const meterFill = document.getElementById("meterFill");
         const ttsPlayer = document.getElementById("ttsPlayer");
+        let recordingActive = false;
 
-        // Open requested website or YouTube tab directly in the user's browser
         if (pendingUrl && pendingUrl.startsWith("http")) {{
           try {{
             window.top.open(pendingUrl, "_blank", "noopener,noreferrer");
@@ -477,15 +479,22 @@ def render_handsfree_hud_component(
           const inputs = parentDoc.querySelectorAll('input[aria-label="vad_audio_payload"]');
           if (inputs.length > 0) {{
             const targetInput = inputs[0];
+            const lastValue = targetInput.value;
             const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
             nativeSetter.call(targetInput, turnId + "::" + base64Wav);
+
+            // Reset React's internal value tracker so Streamlit registers every subsequent turn
+            const tracker = targetInput._valueTracker;
+            if (tracker) {{
+              tracker.setValue(lastValue);
+            }}
             targetInput.dispatchEvent(new Event("input", {{ bubbles: true }}));
             targetInput.dispatchEvent(new Event("change", {{ bubbles: true }}));
             setTimeout(() => {{
               targetInput.dispatchEvent(new KeyboardEvent("keydown", {{
                 key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true
               }}));
-            }}, 80);
+            }}, 100);
           }}
         }}
 
@@ -537,7 +546,8 @@ def render_handsfree_hud_component(
         }}
 
         async function startAutoSilenceRecording() {{
-          if (!handsFree) return;
+          if (!handsFree || recordingActive) return;
+          recordingActive = true;
           try {{
             const stream = await navigator.mediaDevices.getUserMedia({{ audio: true }});
             const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -548,8 +558,8 @@ def render_handsfree_hud_component(
             let speechStarted = false;
             let silenceStart = null;
             let stopped = false;
-            const SILENCE_THRESHOLD = 0.02;
-            const SILENCE_DURATION_MS = 1800;
+            const SILENCE_THRESHOLD = 0.018;
+            const SILENCE_DURATION_MS = 1600;
             const MAX_RECORD_MS = 15000;
             const startTime = Date.now();
 
@@ -560,6 +570,7 @@ def render_handsfree_hud_component(
             function finishRecording() {{
               if (stopped) return;
               stopped = true;
+              recordingActive = false;
               processor.disconnect();
               source.disconnect();
               stream.getTracks().forEach(t => t.stop());
@@ -568,7 +579,7 @@ def render_handsfree_hud_component(
               meterFill.style.width = "0%";
 
               if (!speechStarted) {{
-                if (handsFree) setTimeout(startAutoSilenceRecording, 300);
+                if (handsFree) setTimeout(startAutoSilenceRecording, 250);
                 return;
               }}
               orb.className = "avatar-orb";
@@ -616,9 +627,17 @@ def render_handsfree_hud_component(
             source.connect(processor);
             processor.connect(audioCtx.destination);
           }} catch (err) {{
+            recordingActive = false;
             statusText.style.color = "#f87171";
             statusText.innerText = "● Mic blocked: Allow microphone access in browser";
           }}
+        }}
+
+        function resumeAfterSpeech() {{
+          orb.className = "avatar-orb";
+          statusText.style.color = "#38bdf8";
+          statusText.innerText = "● Standby";
+          if (handsFree) setTimeout(startAutoSilenceRecording, 350);
         }}
 
         if (replyB64 && replyB64.length > 10) {{
@@ -626,15 +645,22 @@ def render_handsfree_hud_component(
           statusText.style.color = "#c084fc";
           statusText.innerText = "● Speaking...";
           ttsPlayer.src = "data:audio/mp3;base64," + replyB64;
-          ttsPlayer.onended = () => {{
-            orb.className = "avatar-orb";
-            statusText.style.color = "#38bdf8";
-            statusText.innerText = "● Standby";
-            if (handsFree) setTimeout(startAutoSilenceRecording, 400);
+
+          let resumed = false;
+          const safeResume = () => {{
+            if (resumed) return;
+            resumed = true;
+            resumeAfterSpeech();
           }};
-          ttsPlayer.play().catch(() => {{
-            if (handsFree) setTimeout(startAutoSilenceRecording, 400);
-          }});
+
+          ttsPlayer.onended = safeResume;
+          ttsPlayer.onerror = safeResume;
+          ttsPlayer.play().catch(safeResume);
+
+          // Watchdog fallback in case browser suspends audio tab playback
+          setTimeout(() => {{
+            if (ttsPlayer.paused && !resumed) safeResume();
+          }}, 12000);
         }} else if (handsFree) {{
           startAutoSilenceRecording();
         }}
