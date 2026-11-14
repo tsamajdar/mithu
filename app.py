@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import json
 import wave
 import time
@@ -8,7 +9,6 @@ import asyncio
 import shutil
 import tempfile
 import threading
-import webbrowser
 from pathlib import Path
 
 import numpy as np
@@ -31,7 +31,7 @@ VOICE_MAP = {
     "English (US - Aria)": "en-US-AriaNeural",
 }
 
-WORKSPACE_DIR = Path.home() / "Desktop" / "AI_Companion_Workspace"
+WORKSPACE_DIR = Path(tempfile.gettempdir()) / "ai_companion_workspace"
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -52,7 +52,8 @@ def load_whisper(model_size: str = "base"):
 
 def synthesize_speech_b64(text: str, voice: str) -> str:
     """Generates base64 MP3 audio using Microsoft Edge Neural TTS."""
-    clean_text = text.replace("*", "").replace("#", "").replace("`", "").strip()
+    clean_text = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", text)
+    clean_text = clean_text.replace("*", "").replace("#", "").replace("`", "").strip()
     if not clean_text:
         return ""
 
@@ -73,8 +74,27 @@ def synthesize_speech_b64(text: str, voice: str) -> str:
 
 
 # ---------------------------------------------------------
-# 2. Specialist Team Tools + Background Builder
+# 2. Client-Side URL Resolver & Specialist Team Tools
 # ---------------------------------------------------------
+def resolve_browser_url(target: str) -> str:
+    """Normalizes spoken domains like 'super web.co.in' or builds a YouTube search URL."""
+    cleaned = target.strip()
+    domain_candidate = re.sub(r"\s*\.\s*", ".", cleaned)
+    if "." in domain_candidate and " " not in domain_candidate.replace("https://", "").replace("http://", ""):
+        if not domain_candidate.startswith(("http://", "https://")):
+            return f"https://{domain_candidate}"
+        return domain_candidate
+
+    if re.search(r"\.(com|in|co\.in|org|net|io|ai|app|edu|gov)\b", cleaned, re.IGNORECASE):
+        compact = re.sub(r"\s+", "", cleaned)
+        if not compact.startswith(("http://", "https://")):
+            return f"https://{compact}"
+        return compact
+
+    query = requests.utils.quote(cleaned)
+    return f"https://www.youtube.com/results?search_query={query}"
+
+
 def web_research(query: str) -> str:
     try:
         with DDGS() as ddgs:
@@ -88,19 +108,6 @@ def web_research(query: str) -> str:
         return f"Research error: {e}"
 
 
-def open_browser_or_youtube(target: str) -> str:
-    try:
-        if target.startswith(("http://", "https://")):
-            webbrowser.open(target)
-            return f"Opened {target} in browser."
-        query = requests.utils.quote(target)
-        url = f"https://www.youtube.com/results?search_query={query}"
-        webbrowser.open(url)
-        return f"Opened YouTube search for '{target}'."
-    except Exception as e:
-        return f"Browser error: {e}"
-
-
 def organize_windows_folder(folder_name: str = "Downloads") -> str:
     shortcuts = {
         "desktop": Path.home() / "Desktop",
@@ -109,7 +116,7 @@ def organize_windows_folder(folder_name: str = "Downloads") -> str:
     }
     target = shortcuts.get(folder_name.lower().strip(), Path(folder_name).expanduser())
     if not target.exists() or not target.is_dir():
-        return f"Folder not found: {target}"
+        return f"Folder not found on host environment: {target}"
 
     categories = {
         "Images": {".jpg", ".jpeg", ".png", ".gif", ".webp"},
@@ -155,7 +162,7 @@ def spawn_background_website_builder(
     model_id: str,
     project_title: str,
     requirements: str,
-) -> str:
+) -> tuple[str, Path]:
     safe_slug = "".join(c if c.isalnum() else "_" for c in project_title.lower()).strip("_")
     out_file = WORKSPACE_DIR / f"{safe_slug or 'landing_page'}.html"
 
@@ -178,12 +185,14 @@ def spawn_background_website_builder(
             )
             html_code = (resp.choices[0].message.content or "").replace("```html", "").replace("```", "").strip()
             out_file.write_text(html_code, encoding="utf-8")
-            webbrowser.open(out_file.as_uri())
         except Exception as e:
             (WORKSPACE_DIR / "build_error.log").write_text(str(e), encoding="utf-8")
 
     threading.Thread(target=_build_worker, daemon=True).start()
-    return f"Dev Team started building '{project_title}' in the background. Saved to {out_file} and will open in your browser automatically."
+    return (
+        f"Dev Team started building '{project_title}' in the background. It will appear in the Generated Websites panel once ready.",
+        out_file,
+    )
 
 
 TOOLS = [
@@ -203,7 +212,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "build_or_update_website",
-            "description": "[Dev Team] Asynchronously build or upgrade an HTML/Tailwind landing page in the background and open it in Chrome.",
+            "description": "[Dev Team] Asynchronously build or upgrade an HTML/Tailwind landing page in the background.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -218,7 +227,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "open_browser_or_youtube",
-            "description": "[Browser Control] Open a URL or search/play a song or video on YouTube.",
+            "description": "[Browser Control] Open a website URL (e.g. superweb.co.in) or search/play a song or video on YouTube.",
             "parameters": {
                 "type": "object",
                 "properties": {"target": {"type": "string"}},
@@ -268,7 +277,7 @@ def run_orchestrator(
     language_pref: str,
     n8n_url: str,
     conversation: list,
-) -> tuple[str, list]:
+) -> tuple[str, list, str]:
     system_prompt = (
         f"You are {agent_name}, a warm, intelligent voice-first personal AI assistant for {user_name}. "
         f"Context: {business_context}. Preferred language style: {language_pref}. "
@@ -278,6 +287,7 @@ def run_orchestrator(
     client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
     messages = [{"role": "system", "content": system_prompt}] + conversation[-10:]
     logs = []
+    url_to_open = ""
 
     try:
         for _ in range(4):
@@ -291,7 +301,10 @@ def run_orchestrator(
             msg = resp.choices[0].message
 
             if not msg.tool_calls:
-                return msg.content or "Done.", logs
+                final_text = msg.content or "Done."
+                if url_to_open and url_to_open not in final_text:
+                    final_text += f"\n\n🔗 [Open {url_to_open}]({url_to_open})"
+                return final_text, logs, url_to_open
 
             messages.append(
                 {
@@ -319,14 +332,17 @@ def run_orchestrator(
                     team, out = "Research Team", web_research(**args)
                 elif fn == "build_or_update_website":
                     team = "Dev Team (Background)"
-                    out = spawn_background_website_builder(
+                    out, _ = spawn_background_website_builder(
                         api_key,
                         model_id,
                         args.get("project_title", "Landing Page"),
                         args.get("requirements", ""),
                     )
                 elif fn == "open_browser_or_youtube":
-                    team, out = "Browser Control", open_browser_or_youtube(**args)
+                    team = "Browser Control"
+                    resolved = resolve_browser_url(args.get("target", ""))
+                    url_to_open = resolved
+                    out = f"Resolved client browser URL: {resolved}"
                 elif fn == "organize_windows_folder":
                     team, out = "Operations Team", organize_windows_folder(**args)
                 elif fn == "trigger_n8n_operations":
@@ -349,20 +365,21 @@ def run_orchestrator(
                     }
                 )
 
-        return "Completed multi-step workflow.", logs
+        return "Completed multi-step workflow.", logs, url_to_open
     except RateLimitError:
-        return "OpenRouter free rate limit reached. Please wait a moment or switch models in the sidebar.", logs
+        return "OpenRouter free rate limit reached. Please wait a moment or switch models in the sidebar.", logs, ""
     except Exception as e:
-        return f"API error: {e}", logs
+        return f"API error: {e}", logs, ""
 
 
 # ---------------------------------------------------------
-# 4. Hands-Free VAD Avatar Component (16kHz PCM WAV + Auto-Loop)
+# 4. Hands-Free VAD Avatar Component (Client-Side Tab Open + Auto-Loop)
 # ---------------------------------------------------------
 def render_handsfree_hud_component(
     agent_name: str,
     hands_free_on: bool,
     reply_audio_b64: str,
+    open_url: str,
     turn_id: int,
 ):
     html_code = f"""
@@ -439,11 +456,21 @@ def render_handsfree_hud_component(
       <script>
         const handsFree = {str(hands_free_on).lower()};
         const replyB64 = "{reply_audio_b64}";
+        const pendingUrl = "{open_url}";
         const turnId = {turn_id};
         const orb = document.getElementById("orb");
         const statusText = document.getElementById("statusText");
         const meterFill = document.getElementById("meterFill");
         const ttsPlayer = document.getElementById("ttsPlayer");
+
+        // Open requested website or YouTube tab directly in the user's browser
+        if (pendingUrl && pendingUrl.startsWith("http")) {{
+          try {{
+            window.top.open(pendingUrl, "_blank", "noopener,noreferrer");
+          }} catch (e) {{
+            window.open(pendingUrl, "_blank", "noopener,noreferrer");
+          }}
+        }}
 
         function sendAudioToStreamlit(base64Wav) {{
           const parentDoc = window.parent.document;
@@ -674,9 +701,25 @@ with st.sidebar:
     )
     n8n_url = st.text_input("n8n Webhook URL", value="http://localhost:5678/webhook/agent-ops")
 
+    # Show any websites generated in the background by the Dev Team
+    generated_files = sorted(WORKSPACE_DIR.glob("*.html"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if generated_files:
+        st.divider()
+        st.subheader("💻 Dev Team Builds")
+        for f in generated_files:
+            st.download_button(
+                label=f"⬇️ Download {f.name}",
+                data=f.read_bytes(),
+                file_name=f.name,
+                mime="text/html",
+                key=f"dl_{f.name}",
+                use_container_width=True,
+            )
+
     if st.button("🗑️ Clear Chat", use_container_width=True):
         st.session_state.messages = []
         st.session_state.reply_audio_b64 = ""
+        st.session_state.pending_open_url = ""
         st.rerun()
 
 if "messages" not in st.session_state:
@@ -685,6 +728,8 @@ if "hands_free_on" not in st.session_state:
     st.session_state.hands_free_on = False
 if "reply_audio_b64" not in st.session_state:
     st.session_state.reply_audio_b64 = ""
+if "pending_open_url" not in st.session_state:
+    st.session_state.pending_open_url = ""
 if "turn_id" not in st.session_state:
     st.session_state.turn_id = 0
 if "last_processed_turn" not in st.session_state:
@@ -699,16 +744,19 @@ with c2:
     if st.button(btn_label, use_container_width=True, type="primary"):
         st.session_state.hands_free_on = not st.session_state.hands_free_on
         st.session_state.reply_audio_b64 = ""
+        st.session_state.pending_open_url = ""
         st.rerun()
 
-# Render Glowing HUD + Hands-Free Auto-Stop Voice Loop
+# Render Glowing HUD + Hands-Free Auto-Stop Voice Loop + Client Tab Opener
 render_handsfree_hud_component(
     agent_name=agent_name,
     hands_free_on=st.session_state.hands_free_on,
     reply_audio_b64=st.session_state.reply_audio_b64,
+    open_url=st.session_state.pending_open_url,
     turn_id=st.session_state.turn_id,
 )
 st.session_state.reply_audio_b64 = ""
+st.session_state.pending_open_url = ""
 
 # Hidden bridge input receiving base64 16kHz PCM WAV audio from browser VAD
 vad_payload = st.text_input("vad_audio_payload", key="vad_bridge")
@@ -763,7 +811,7 @@ if active_prompt:
         {"role": m["role"], "content": m["content"]}
         for m in st.session_state.messages
     ]
-    reply, logs = run_orchestrator(
+    reply, logs, url_to_open = run_orchestrator(
         api_key=api_key,
         model_id=model_id,
         agent_name=agent_name,
@@ -776,6 +824,8 @@ if active_prompt:
 
     if voice_enabled:
         st.session_state.reply_audio_b64 = synthesize_speech_b64(reply, selected_voice)
+    if url_to_open:
+        st.session_state.pending_open_url = url_to_open
 
     st.session_state.messages.append({"role": "assistant", "content": reply, "logs": logs})
     st.session_state.turn_id += 1
