@@ -2,6 +2,7 @@ streamlit
 openai
 edge-tts
 faster-whisper
+av
 numpy
 ddgs
 requests

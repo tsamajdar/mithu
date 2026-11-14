@@ -2,7 +2,6 @@ import os
 import io
 import re
 import json
-import wave
 import time
 import base64
 import asyncio
@@ -11,6 +10,7 @@ import tempfile
 import threading
 from pathlib import Path
 
+import av
 import numpy as np
 import requests
 from ddgs import DDGS
@@ -50,6 +50,21 @@ def load_whisper(model_size: str = "base"):
     return WhisperModel(model_size, device="cpu", compute_type="int8")
 
 
+def decode_audio_bytes_to_16k_float32(audio_bytes: bytes) -> np.ndarray:
+    """Decodes browser WebM/Ogg/WAV bytes into 16kHz mono float32 PCM via PyAV without metadata_errors."""
+    container = av.open(io.BytesIO(audio_bytes))
+    resampler = av.audio.resampler.AudioResampler(format="fltp", layout="mono", rate=16000)
+    chunks = []
+    for frame in container.decode(audio=0):
+        for resampled in resampler.resample(frame):
+            arr = resampled.to_ndarray()
+            chunks.append(arr.reshape(-1))
+    container.close()
+    if not chunks:
+        return np.zeros(0, dtype=np.float32)
+    return np.concatenate(chunks).astype(np.float32)
+
+
 def synthesize_speech_b64(text: str, voice: str) -> str:
     """Generates base64 MP3 audio using Microsoft Edge Neural TTS."""
     clean_text = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", text)
@@ -77,7 +92,6 @@ def synthesize_speech_b64(text: str, voice: str) -> str:
 # 2. Client-Side URL Resolver & Specialist Team Tools
 # ---------------------------------------------------------
 def resolve_browser_url(target: str) -> str:
-    """Normalizes spoken domains like 'super web.co.in' or builds a YouTube search URL."""
     cleaned = target.strip()
     domain_candidate = re.sub(r"\s*\.\s*", ".", cleaned)
     if "." in domain_candidate and " " not in domain_candidate.replace("https://", "").replace("http://", ""):
@@ -373,7 +387,7 @@ def run_orchestrator(
 
 
 # ---------------------------------------------------------
-# 4. Hands-Free VAD Avatar Component (JSON-Safe + Click-to-Wake)
+# 4. Hands-Free VAD Avatar Component (AnalyserNode + MediaRecorder)
 # ---------------------------------------------------------
 def render_handsfree_hud_component(
     agent_name: str,
@@ -439,11 +453,18 @@ def render_handsfree_hud_component(
       .eye {{ width: 7px; height: 7px; background: #f8fafc; border-radius: 50%; }}
       .title {{ font-size: 18px; font-weight: 700; margin: 0 0 4px 0; }}
       .status {{ font-size: 13px; color: #38bdf8; margin: 0; }}
+      .meter-row {{ display: flex; align-items: center; gap: 8px; margin-top: 6px; }}
       .meter-bar {{
-        width: 180px; height: 6px; background: #1e293b;
-        border-radius: 4px; margin-top: 6px; overflow: hidden;
+        width: 160px; height: 6px; background: #1e293b;
+        border-radius: 4px; overflow: hidden;
       }}
-      .meter-fill {{ height: 100%; width: 0%; background: #4ade80; transition: width 0.08s linear; }}
+      .meter-fill {{ height: 100%; width: 0%; background: #4ade80; transition: width 0.06s linear; }}
+      .lvl-txt {{ font-size: 11px; color: #94a3b8; font-family: monospace; }}
+      .send-btn {{
+        background: #0284c7; color: #fff; border: none; border-radius: 10px;
+        padding: 8px 12px; font-size: 12px; font-weight: 600; cursor: pointer;
+      }}
+      .send-btn:hover {{ background: #0369a1; }}
     </style>
     </head>
     <body>
@@ -455,9 +476,13 @@ def render_handsfree_hud_component(
           <div>
             <div class="title" id="titleBox"></div>
             <div id="statusText" class="status">● Initializing...</div>
-            <div class="meter-bar"><div id="meterFill" class="meter-fill"></div></div>
+            <div class="meter-row">
+              <div class="meter-bar"><div id="meterFill" class="meter-fill"></div></div>
+              <span id="lvlTxt" class="lvl-txt">lvl: 0</span>
+            </div>
           </div>
         </div>
+        <button id="sendNowBtn" class="send-btn" style="display:none;">Send Now ↵</button>
         <audio id="ttsPlayer"></audio>
       </div>
 
@@ -472,11 +497,14 @@ def render_handsfree_hud_component(
         const titleBox = document.getElementById("titleBox");
         const statusText = document.getElementById("statusText");
         const meterFill = document.getElementById("meterFill");
+        const lvlTxt = document.getElementById("lvlTxt");
+        const sendNowBtn = document.getElementById("sendNowBtn");
         const ttsPlayer = document.getElementById("ttsPlayer");
+
         let recordingActive = false;
         let forceStopFn = null;
 
-        titleBox.innerHTML = agentName + ' <span style="font-size:11px;color:#94a3b8;">(Turn ' + (turnId + 1) + ')</span>';
+        titleBox.innerHTML = agentName + ' <span style="font-size:11px;color:#94a3b8;">(v3 • Turn ' + (turnId + 1) + ')</span>';
 
         if (pendingUrl && pendingUrl.startsWith("http")) {{
           try {{
@@ -486,14 +514,14 @@ def render_handsfree_hud_component(
           }}
         }}
 
-        function sendAudioToStreamlit(base64Wav) {{
+        function sendAudioToStreamlit(base64Audio) {{
           const parentDoc = window.parent.document;
           const inputs = parentDoc.querySelectorAll('input[aria-label="vad_audio_payload"]');
           if (inputs.length > 0) {{
             const targetInput = inputs[0];
             const lastValue = targetInput.value;
             const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-            nativeSetter.call(targetInput, turnId + "::" + base64Wav);
+            nativeSetter.call(targetInput, turnId + "::" + base64Audio);
 
             const tracker = targetInput._valueTracker;
             if (tracker) tracker.setValue(lastValue);
@@ -511,148 +539,117 @@ def render_handsfree_hud_component(
           }}
         }}
 
-        function encodeWAV(samples, sampleRate) {{
-          const buffer = new ArrayBuffer(44 + samples.length * 2);
-          const view = new DataView(buffer);
-          const writeStr = (offset, str) => {{
-            for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
-          }};
-          writeStr(0, 'RIFF');
-          view.setUint32(4, 36 + samples.length * 2, true);
-          writeStr(8, 'WAVE');
-          writeStr(12, 'fmt ');
-          view.setUint32(16, 16, true);
-          view.setUint16(20, 1, true);
-          view.setUint16(22, 1, true);
-          view.setUint32(24, sampleRate, true);
-          view.setUint32(28, sampleRate * 2, true);
-          view.setUint16(32, 2, true);
-          view.setUint16(34, 16, true);
-          writeStr(36, 'data');
-          view.setUint32(40, samples.length * 2, true);
-          let offset = 44;
-          for (let i = 0; i < samples.length; i++, offset += 2) {{
-            const s = Math.max(-1, Math.min(1, samples[i]));
-            view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-          }}
-          return new Blob([view], {{ type: 'audio/wav' }});
-        }}
-
-        function downsample(buffer, inRate, outRate) {{
-          if (outRate === inRate) return buffer;
-          const ratio = inRate / outRate;
-          const newLen = Math.round(buffer.length / ratio);
-          const result = new Float32Array(newLen);
-          let offsetResult = 0, offsetBuffer = 0;
-          while (offsetResult < result.length) {{
-            const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
-            let accum = 0, count = 0;
-            for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {{
-              accum += buffer[i];
-              count++;
-            }}
-            result[offsetResult] = accum / count;
-            offsetResult++;
-            offsetBuffer = nextOffsetBuffer;
-          }}
-          return result;
-        }}
-
         async function startAutoSilenceRecording() {{
           if (!handsFree || recordingActive) return;
           recordingActive = true;
           try {{
             statusText.style.color = "#facc15";
             statusText.innerText = "● Opening microphone...";
-            const stream = await navigator.mediaDevices.getUserMedia({{
-              audio: {{ echoCancellation: true, noiseSuppression: true, autoGainControl: true }}
-            }});
+            const stream = await navigator.mediaDevices.getUserMedia({{ audio: true }});
             const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             if (audioCtx.state === "suspended") await audioCtx.resume();
 
             const source = audioCtx.createMediaStreamSource(stream);
-            const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+            const analyser = audioCtx.createAnalyser();
+            analyser.fftSize = 1024;
+            source.connect(analyser);
 
-            const pcmChunks = [];
+            const mediaRecorder = new MediaRecorder(stream);
+            const chunks = [];
+            mediaRecorder.ondataavailable = (e) => {{
+              if (e.data && e.data.size > 0) chunks.push(e.data);
+            }};
+
             let speechStarted = false;
             let silenceStart = null;
             let stopped = false;
-            const SPEECH_THRESHOLD = 0.004;
-            const SILENCE_DURATION_MS = 1500;
+            let manualForced = false;
+            const SPEECH_THRESHOLD = 3; // 0-100 scale (very sensitive for laptop mics)
+            const SILENCE_DURATION_MS = 1600;
             const MAX_RECORD_MS = 15000;
             const startTime = Date.now();
 
             orb.className = "avatar-orb listening";
             statusText.style.color = "#4ade80";
             statusText.innerText = "● Listening (Speak now — auto-sends on pause)...";
+            sendNowBtn.style.display = "inline-block";
 
-            function finishRecording(manualForce = false) {{
+            function stopAndSubmit(isManual) {{
               if (stopped) return;
               stopped = true;
+              manualForced = isManual;
+              sendNowBtn.style.display = "none";
+              if (mediaRecorder.state !== "inactive") {{
+                mediaRecorder.stop();
+              }}
+            }}
+
+            forceStopFn = () => stopAndSubmit(true);
+            sendNowBtn.onclick = () => stopAndSubmit(true);
+
+            mediaRecorder.onstop = () => {{
               recordingActive = false;
               forceStopFn = null;
-              processor.disconnect();
-              source.disconnect();
               stream.getTracks().forEach(t => t.stop());
-              const nativeRate = audioCtx.sampleRate;
               audioCtx.close();
               meterFill.style.width = "0%";
+              lvlTxt.innerText = "lvl: 0";
 
-              if (!speechStarted && !manualForce) {{
-                if (handsFree) setTimeout(startAutoSilenceRecording, 200);
+              if (!speechStarted && !manualForced) {{
+                if (handsFree) setTimeout(startAutoSilenceRecording, 250);
                 return;
               }}
+
               orb.className = "avatar-orb";
               statusText.style.color = "#facc15";
               statusText.innerText = "● Transcribing your voice...";
 
-              let totalLen = pcmChunks.reduce((acc, c) => acc + c.length, 0);
-              let merged = new Float32Array(totalLen);
-              let pos = 0;
-              for (let c of pcmChunks) {{ merged.set(c, pos); pos += c.length; }}
-
-              const downsampled = downsample(merged, nativeRate, 16000);
-              const wavBlob = encodeWAV(downsampled, 16000);
+              const blob = new Blob(chunks, {{ type: mediaRecorder.mimeType || "audio/webm" }});
               const reader = new FileReader();
               reader.onloadend = () => {{
                 const b64 = reader.result.split(",")[1];
                 sendAudioToStreamlit(b64);
               }};
-              reader.readAsDataURL(wavBlob);
-            }}
+              reader.readAsDataURL(blob);
+            }};
 
-            forceStopFn = () => finishRecording(true);
+            mediaRecorder.start(250);
 
-            processor.onaudioprocess = (e) => {{
+            const dataArray = new Uint8Array(analyser.frequencyBinCount);
+            function monitorVolume() {{
               if (stopped) return;
-              const input = e.inputBuffer.getChannelData(0);
-              pcmChunks.push(new Float32Array(input));
-
+              analyser.getByteFrequencyData(dataArray);
               let sum = 0;
-              for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
-              const rms = Math.sqrt(sum / input.length);
-              meterFill.style.width = Math.min(100, Math.round(rms * 1500)) + "%";
+              for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+              const avgLevel = Math.round((sum / dataArray.length) / 2.55); // 0 to 100
 
-              if (rms > SPEECH_THRESHOLD) {{
+              meterFill.style.width = Math.min(100, avgLevel * 2) + "%";
+              lvlTxt.innerText = "lvl: " + avgLevel;
+
+              if (avgLevel >= SPEECH_THRESHOLD) {{
                 if (!speechStarted) {{
                   speechStarted = true;
-                  statusText.innerText = "● Hearing you (will send when you pause)...";
+                  statusText.innerText = "● Hearing you (auto-sends when you pause)...";
                 }}
                 silenceStart = null;
               }} else if (speechStarted) {{
                 if (!silenceStart) silenceStart = Date.now();
                 if (Date.now() - silenceStart >= SILENCE_DURATION_MS) {{
-                  finishRecording(false);
+                  stopAndSubmit(false);
                   return;
                 }}
               }}
-              if (Date.now() - startTime >= MAX_RECORD_MS) finishRecording(false);
-            }};
 
-            source.connect(processor);
-            processor.connect(audioCtx.destination);
+              if (Date.now() - startTime >= MAX_RECORD_MS) {{
+                stopAndSubmit(false);
+                return;
+              }}
+              requestAnimationFrame(monitorVolume);
+            }}
+            monitorVolume();
           }} catch (err) {{
             recordingActive = false;
+            sendNowBtn.style.display = "none";
             statusText.style.color = "#f87171";
             statusText.innerText = "● Mic notice: " + (err.message || err);
           }}
@@ -704,7 +701,7 @@ def render_handsfree_hud_component(
     </body>
     </html>
     """
-    components.html(html_code, height=112)
+    components.html(html_code, height=116)
 
 
 # ---------------------------------------------------------
@@ -819,7 +816,7 @@ render_handsfree_hud_component(
 st.session_state.reply_audio_b64 = ""
 st.session_state.pending_open_url = ""
 
-# Hidden bridge input receiving base64 16kHz PCM WAV audio from browser VAD
+# Hidden bridge input receiving base64 browser audio from VAD
 vad_payload = st.text_input("vad_audio_payload", key="vad_bridge")
 
 # Display Transcript
@@ -846,13 +843,14 @@ if vad_payload and "::" in vad_payload:
         st.session_state.last_processed_turn = incoming_turn
         with st.spinner("Transcribing speech..."):
             raw_bytes = base64.b64decode(b64_audio)
-            with wave.open(io.BytesIO(raw_bytes), "rb") as wf:
-                pcm_int16 = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
-                audio_float32 = pcm_int16.astype(np.float32) / 32768.0
+            audio_float32 = decode_audio_bytes_to_16k_float32(raw_bytes)
+            if audio_float32.size > 0:
+                whisper = load_whisper("base")
+                segments, _ = whisper.transcribe(audio_float32, beam_size=1)
+                transcribed = " ".join(seg.text for seg in segments).strip()
+            else:
+                transcribed = ""
 
-            whisper = load_whisper("base")
-            segments, _ = whisper.transcribe(audio_float32, beam_size=1)
-            transcribed = " ".join(seg.text for seg in segments).strip()
             if transcribed:
                 active_prompt = transcribed
             else:
